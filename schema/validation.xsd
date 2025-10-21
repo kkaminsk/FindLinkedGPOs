@@ -1,0 +1,85 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema" elementFormDefault="qualified">
+  <xs:annotation>
+    <xs:documentation>Validation schema for FindLinkedGPOs outputs</xs:documentation>
+  </xs:annotation>
+
+  <xs:simpleType name="guidType">
+    <xs:restriction base="xs:string">
+      <xs:pattern value="\{[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}\}"/>
+    </xs:restriction>
+  </xs:simpleType>
+
+  <xs:simpleType name="rightsType">
+    <xs:restriction base="xs:string">
+      <xs:enumeration value="Read"/>
+      <xs:enumeration value="Apply"/>
+      <xs:enumeration value="Read,Apply"/>
+    </xs:restriction>
+  </xs:simpleType>
+
+  <xs:complexType name="principalType">
+    <xs:attribute name="sid" type="xs:string" use="required"/>
+    <xs:attribute name="name" type="xs:string" use="optional"/>
+    <xs:attribute name="rights" type="rightsType" use="required"/>
+  </xs:complexType>
+
+  <xs:complexType name="securityFilteringType">
+    <xs:sequence>
+      <xs:element name="Principal" type="principalType" maxOccurs="unbounded"/>
+    </xs:sequence>
+  </xs:complexType>
+
+  <xs:complexType name="wmiFilterType">
+    <xs:attribute name="name" type="xs:string" use="required"/>
+    <xs:attribute name="id" type="guidType" use="required"/>
+    <xs:attribute name="query" type="xs:string" use="optional"/>
+  </xs:complexType>
+
+  <xs:complexType name="gpoLinkType">
+    <xs:sequence>
+      <xs:element name="SecurityFiltering" type="securityFilteringType" minOccurs="0"/>
+      <xs:element name="WmiFilter" type="wmiFilterType" minOccurs="0"/>
+    </xs:sequence>
+    <xs:attribute name="displayName" type="xs:string" use="required"/>
+    <xs:attribute name="guid" type="guidType" use="required"/>
+    <xs:attribute name="enabled" type="xs:boolean" use="required"/>
+    <xs:attribute name="enforced" type="xs:boolean" use="required"/>
+    <xs:attribute name="order" type="xs:int" use="required"/>
+  </xs:complexType>
+
+  <xs:complexType name="ouType">
+    <xs:sequence>
+      <xs:element name="GpoLink" type="gpoLinkType" maxOccurs="unbounded"/>
+    </xs:sequence>
+    <xs:attribute name="dn" type="xs:string" use="required"/>
+    <xs:attribute name="inheritanceBlocked" type="xs:boolean" use="optional"/>
+  </xs:complexType>
+
+  <xs:complexType name="domainRootType">
+    <xs:sequence>
+      <xs:element name="GpoLink" type="gpoLinkType" maxOccurs="unbounded"/>
+    </xs:sequence>
+    <xs:attribute name="dn" type="xs:string" use="required"/>
+  </xs:complexType>
+
+  <xs:complexType name="siteType">
+    <xs:sequence>
+      <xs:element name="GpoLink" type="gpoLinkType" maxOccurs="unbounded"/>
+    </xs:sequence>
+    <xs:attribute name="name" type="xs:string" use="required"/>
+  </xs:complexType>
+
+  <xs:element name="FindLinkedGPOs">
+    <xs:complexType>
+      <xs:sequence>
+        <xs:element name="OU" type="ouType" maxOccurs="unbounded" minOccurs="0"/>
+        <xs:element name="DomainRoot" type="domainRootType" maxOccurs="1" minOccurs="0"/>
+        <xs:element name="Site" type="siteType" maxOccurs="unbounded" minOccurs="0"/>
+      </xs:sequence>
+      <xs:attribute name="domain" type="xs:string" use="required"/>
+      <xs:attribute name="generatedUtc" type="xs:dateTime" use="required"/>
+      <xs:attribute name="host" type="xs:string" use="required"/>
+    </xs:complexType>
+  </xs:element>
+</xs:schema>
