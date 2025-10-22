@@ -35,7 +35,7 @@ function Get-DomainRootLinks {
     try {
         $inherit = Get-GPInheritance -Target $DomainDn -ErrorAction Stop
     } catch {
-        Write-Log "Get-GPInheritance failed for domain root $DomainDn: $_" 'WARN'
+        Write-Log "Get-GPInheritance failed for domain root ${DomainDn}: $_" 'WARN'
         return @()
     }
     if ($inherit -and $inherit.GpoLinks) { return @($inherit.GpoLinks) }
@@ -327,7 +327,7 @@ function Get-GpoLinksForOu {
     try {
         $inherit = Get-GPInheritance -Target $OuDn -ErrorAction Stop
     } catch {
-        Write-Log "Get-GPInheritance failed for $OuDn: $_" 'WARN'
+        Write-Log "Get-GPInheritance failed for ${OuDn}: $_" 'WARN'
         return @()
     }
     if ($inherit -and $inherit.GpoLinks) { return @($inherit.GpoLinks) }
@@ -426,7 +426,7 @@ foreach ($dom in $domains) {
     try {
         $domainDn = (Get-ADDomain -Server $dom).DistinguishedName
         $base = if ($SearchBase) { $SearchBase } else { $domainDn }
-    } catch { Write-Log "Failed to resolve domain $dom: $_" 'WARN'; continue }
+    } catch { Write-Log "Failed to resolve domain ${dom}: $_" 'WARN'; continue }
 
     if (-not $ExcludeDomainRoot) {
         $rootLinks = Get-DomainRootLinks -DomainDn $domainDn
@@ -436,7 +436,7 @@ foreach ($dom in $domains) {
     if ($adAvailable) {
         try {
             $ous = Get-ADOrganizationalUnit -Server $dom -SearchBase $base -SearchScope Subtree -Filter * -Properties gPOptions | Sort-Object DistinguishedName
-        } catch { Write-Log "Get-ADOrganizationalUnit failed for $dom: $_" 'WARN' }
+        } catch { Write-Log "Get-ADOrganizationalUnit failed for ${dom}: $_" 'WARN' }
     }
     foreach ($ou in $ous) {
         $inheritBlocked = $false
