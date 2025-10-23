@@ -494,11 +494,30 @@ function Get-WmiFilterQueryFromXml {
     param([Parameter(Mandatory)][string]$XmlPath)
     try {
         [xml]$doc = Get-Content -LiteralPath $XmlPath -Raw -ErrorAction Stop
-        # Look for Query element within WMI filter section
-        $node = $doc.SelectSingleNode("//*[translate(local-name(),'abcdefghijklmnopqrstuvwxyz','ABCDEFGHIJKLMNOPQRSTUVWXYZ')='QUERY']")
-        if ($node -and $node.InnerText) {
-            return $node.InnerText.Trim()
+        
+        # Try multiple XPath patterns to locate WMI filter query
+        # Pattern 1: GPO namespace (most common)
+        $ns = New-Object System.Xml.XmlNamespaceManager($doc.NameTable)
+        $ns.AddNamespace('gpo', 'http://www.microsoft.com/GroupPolicy/Settings')
+        $node = $doc.SelectSingleNode('//gpo:FilterName/../gpo:Query', $ns)
+        
+        if (-not $node) {
+            # Pattern 2: Look for any Query element near WMI filter references
+            $node = $doc.SelectSingleNode("//*[local-name()='Query' and ../*[local-name()='FilterName' or local-name()='Name']]")
         }
+        
+        if (-not $node) {
+            # Pattern 3: Generic Query element search
+            $node = $doc.SelectSingleNode("//*[local-name()='Query']")
+        }
+        
+        if ($node -and $node.InnerText) {
+            $query = $node.InnerText.Trim()
+            Write-Log "Successfully extracted WMI filter query (${query.Length} chars)" 'INFO'
+            return $query
+        }
+        
+        Write-Log "WMI filter query element not found in GPO report XML" 'WARN'
     } catch {
         Write-Log "Failed to parse WMI filter query from XML: $_" 'WARN'
     }
@@ -516,8 +535,23 @@ function Get-GpoWmiInfo {
     try {
         $gpoObj = Get-GPO -Guid $GpoId -Domain $Domain -ErrorAction Stop
         if ($gpoObj.WmiFilter) {
-            $name = [string]$gpoObj.WmiFilter.Name
-            $id = [string]$gpoObj.WmiFilter.Id
+            # WmiFilter is a Microsoft.GroupPolicy.WmiFilter object
+            $wmiFilterObj = $gpoObj.WmiFilter
+            
+            # Access properties directly from the WmiFilter object
+            if ($wmiFilterObj.Name) {
+                $name = [string]$wmiFilterObj.Name
+            }
+            
+            # Extract GUID from Path property (DN string)
+            if ($wmiFilterObj.Path) {
+                $path = [string]$wmiFilterObj.Path
+                
+                # Extract GUID from the DN path
+                if ($path -match '\{[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}\}') {
+                    $id = $Matches[0]
+                }
+            }
             
             # Extract query if not skipping and not already cached
             if (-not $SkipWmiQueries -and $id) {
@@ -526,26 +560,41 @@ function Get-GpoWmiInfo {
                 if ($script:WmiFilterQueries.ContainsKey($normalizedId)) {
                     # Use cached query
                     $query = $script:WmiFilterQueries[$normalizedId].Query
+                    Write-Log "Using cached WMI filter query for: $name ($normalizedId)"
                 } else {
-                    # Generate temporary XML to extract query
+                    # Query WMI filter directly from AD
+                    Write-Log "Querying WMI filter from AD: $name ($normalizedId)"
                     try {
-                        $tempFile = [System.IO.Path]::GetTempFileName()
-                        Get-GPOReport -Guid $GpoId -Domain $Domain -ReportType Xml -Path $tempFile -ErrorAction Stop | Out-Null
-                        $query = Get-WmiFilterQueryFromXml -XmlPath $tempFile
+                        # WMI filters are stored in AD at CN=SOM,CN=WMIPolicy,CN=System,DC=...
+                        $domainDN = (Get-ADDomain -Server $Domain -ErrorAction Stop).DistinguishedName
+                        $wmiFilterDN = "CN=$normalizedId,CN=SOM,CN=WMIPolicy,CN=System,$domainDN"
                         
-                        # Cache the result
+                        # Query the WMI filter object from AD
+                        $adFilter = Get-ADObject -Identity $wmiFilterDN -Properties 'msWMI-Parm2' -Server $Domain -ErrorAction Stop
+                        
+                        if ($adFilter.'msWMI-Parm2') {
+                            $query = [string]$adFilter.'msWMI-Parm2'
+                            $queryLen = if ($query) { $query.Length } else { 0 }
+                            Write-Log "Successfully retrieved WMI filter query from AD: $queryLen chars"
+                        } else {
+                            Write-Log "WMI filter in AD has no msWMI-Parm2 attribute (query)" 'WARN'
+                        }
+                        
+                        # Cache the result (even if query is null, to avoid retrying)
                         $script:WmiFilterQueries[$normalizedId] = [pscustomobject]@{
                             Name  = $name
                             Id    = $normalizedId
                             Query = $query
                         }
-                        
-                        Write-Log "Extracted WMI filter query for: $name ($normalizedId)"
                     } catch {
-                        Write-Log "Failed to extract WMI filter query for GPO ${GpoId}: $_" 'WARN'
-                    } finally {
-                        if ($tempFile -and (Test-Path $tempFile)) {
-                            Remove-Item $tempFile -Force -ErrorAction SilentlyContinue
+                        $errorMsg = $_.Exception.Message
+                        Write-Log "Failed to query WMI filter from AD: $errorMsg" 'WARN'
+                        
+                        # Cache null result to avoid retrying
+                        $script:WmiFilterQueries[$normalizedId] = [pscustomobject]@{
+                            Name  = $name
+                            Id    = $normalizedId
+                            Query = $null
                         }
                     }
                 }
@@ -657,6 +706,13 @@ function Write-WmiFilterFiles {
     
     foreach ($filterId in $FilterCache.Keys) {
         $filter = $FilterCache[$filterId]
+        
+        # Skip filters without query text
+        if (-not $filter.Query) {
+            Write-Log "Skipping WMI filter '$($filter.Name)' - no query text available" 'WARN'
+            continue
+        }
+        
         $fileName = "$filterId.xml"
         $filePath = Join-Path $WmiFolder $fileName
         
