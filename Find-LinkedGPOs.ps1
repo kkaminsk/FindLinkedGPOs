@@ -1,4 +1,86 @@
 #requires -Version 5.1
+<#
+.SYNOPSIS
+    Audits Active Directory Group Policy Object (GPO) links and exports detailed GPO reports.
+
+.DESCRIPTION
+    Find-LinkedGPOs enumerates all GPOs in an Active Directory domain and identifies which are linked to OUs, 
+    the domain root, or Sites. For each GPO, it exports both XML and HTML reports and organizes them by 
+    linked/unlinked status. The script also captures GPO link attributes, security filtering, and WMI filters.
+
+.PARAMETER OutputRoot
+    Specifies the root directory for output. If not provided, the script will prompt interactively.
+    Default locations: Documents, C:\Temp, or custom path.
+
+.PARAMETER SkipGpoReports
+    Skips all GPO report exports (both XML and HTML). Maintained for backward compatibility.
+    Equivalent to specifying both -SkipXml and -SkipHtml.
+
+.PARAMETER SkipXml
+    Skips XML report generation. HTML reports will still be created unless -SkipHtml is also specified.
+
+.PARAMETER SkipHtml
+    Skips HTML report generation. XML reports will still be created unless -SkipXml is also specified.
+
+.PARAMETER Domain
+    Specifies one or more domains to enumerate. If not provided, uses the current domain.
+
+.PARAMETER Credential
+    Specifies alternate credentials for domain access.
+
+.PARAMETER SearchBase
+    Specifies the LDAP search base for OU enumeration. If not provided, searches the entire domain.
+
+.PARAMETER ExcludeDomainRoot
+    Excludes the domain root from link enumeration.
+
+.PARAMETER NoZip
+    Prevents automatic ZIP compression of the output folder.
+
+.EXAMPLE
+    .\Find-LinkedGPOs.ps1
+    
+    Runs interactively, prompting for output location. Exports all GPOs with both XML and HTML reports.
+
+.EXAMPLE
+    .\Find-LinkedGPOs.ps1 -OutputRoot "C:\Temp" -SkipHtml
+    
+    Exports to C:\Temp with only XML reports (no HTML).
+
+.EXAMPLE
+    .\Find-LinkedGPOs.ps1 -Domain "contoso.com","fabrikam.com" -NoZip
+    
+    Audits multiple domains and skips ZIP compression.
+
+.EXAMPLE
+    .\Find-LinkedGPOs.ps1 -SkipGpoReports
+    
+    Audits GPO links but skips all report generation (backward compatibility mode).
+
+.OUTPUTS
+    Creates a timestamped folder structure:
+    Find-LinkedGPOs-YYYY-MM-DD-HH-MM/
+    ├── GPO/
+    │   ├── linked/       (GPOs linked to OUs/domain/sites)
+    │   │   ├── GPOName.xml
+    │   │   └── GPOName.html
+    │   └── unlinked/     (GPOs not linked anywhere)
+    │       ├── GPOName.xml
+    │       └── GPOName.html
+    ├── *.xml files       (Per-OU and domain root link data)
+    ├── linked-gpos.xml   (Aggregated index)
+    ├── validation.xsd    (XML schema)
+    └── Find-LinkedGPOs-YYYY-MM-DD-HH-MM.log
+
+.NOTES
+    Version: 2.0
+    Requires: ActiveDirectory and GroupPolicy PowerShell modules
+    Requires: PowerShell 5.1 or later
+    Requires: Domain member or RSAT with appropriate permissions
+
+.LINK
+    https://github.com/yourusername/FindLinkedGPOs
+#>
 [CmdletBinding()]
 param(
     [Parameter()]
@@ -6,6 +88,12 @@ param(
 
     [Parameter()]
     [switch]$SkipGpoReports,
+
+    [Parameter()]
+    [switch]$SkipXml,
+
+    [Parameter()]
+    [switch]$SkipHtml,
 
     [Parameter()]
     [string[]]$Domain,
@@ -26,8 +114,26 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+# Backward compatibility: -SkipGpoReports sets both new skip flags
+if ($SkipGpoReports) {
+    $SkipXml = $true
+    $SkipHtml = $true
+}
+
+# Track linked GPO GUIDs for classification
+$script:LinkedGpoGuids = @{}
+
 function New-TimestampString {
     (Get-Date).ToString('yyyy-MM-dd-HH-mm')
+}
+
+function Normalize-GpoGuid {
+    param([Parameter(Mandatory)][string]$GuidStr)
+    $normalized = $GuidStr.Trim()
+    if ($normalized -notmatch '^\{.*\}$') {
+        $normalized = '{' + $normalized.Trim('{}') + '}'
+    }
+    return $normalized.ToUpper()
 }
 
 function Get-DomainRootLinks {
@@ -47,9 +153,7 @@ function Write-DomainRootXml {
         [Parameter(Mandatory)][string]$OutFolder,
         [Parameter(Mandatory)][string]$Domain,
         [Parameter(Mandatory)][string]$DomainDn,
-        [Parameter()][array]$GpoLinks,
-        [Parameter(Mandatory)][string]$ReportsFolder,
-        [Parameter()][switch]$SkipGpoReports
+        [Parameter()][array]$GpoLinks
     )
     $xml = New-Object System.Xml.XmlDocument
     $decl = $xml.CreateXmlDeclaration('1.0','UTF-8',$null)
@@ -71,7 +175,11 @@ function Write-DomainRootXml {
         $guidStr = [string]$link.GPOId
         if (-not $guidStr) { $guidStr = [string]$link.GpoId }
         if ($guidStr -and $guidStr -notmatch '^\{.*\}$') { $guidStr = '{' + $guidStr.Trim('{}') + '}' }
-        if ($guidStr) { $null = $g.SetAttribute('guid', $guidStr) }
+        if ($guidStr) { 
+            $null = $g.SetAttribute('guid', $guidStr)
+            $normalizedGuid = Normalize-GpoGuid -GuidStr $guidStr
+            $script:LinkedGpoGuids[$normalizedGuid] = $true
+        }
         $null = $g.SetAttribute('enabled', ([bool]$link.Enabled).ToString().ToLower())
         $null = $g.SetAttribute('enforced', ([bool]$link.Enforced).ToString().ToLower())
         if ($null -ne $link.Order) { $null = $g.SetAttribute('order', [string]$link.Order) }
@@ -89,12 +197,11 @@ function Write-DomainRootXml {
             $g.AppendChild($sec) | Out-Null
         }
 
-        $wmi = Get-GpoWmiInfo -GpoId $guidStr -ReportsFolder $ReportsFolder -Domain $Domain -SkipReports:$SkipGpoReports
-        if ($wmi.Name -or $wmi.Id -or $wmi.Query) {
+        $wmi = Get-GpoWmiInfo -GpoId $guidStr -Domain $Domain
+        if ($wmi.Name -or $wmi.Id) {
             $w = $xml.CreateElement('WmiFilter')
             if ($wmi.Name) { $null = $w.SetAttribute('name', [string]$wmi.Name) }
             if ($wmi.Id) { $null = $w.SetAttribute('id', [string]$wmi.Id) }
-            if ($wmi.Query) { $null = $w.SetAttribute('query', [string]$wmi.Query) }
             $g.AppendChild($w) | Out-Null
         }
 
@@ -137,15 +244,20 @@ function Initialize-Output {
     $folder = Join-Path $root $folderName
     New-Item -ItemType Directory -Path $folder -Force | Out-Null
     $logFile = Join-Path $folder ("$folderName.log")
-    $reports = Join-Path $folder 'reports'
-    New-Item -ItemType Directory -Path $reports -Force | Out-Null
+    $gpoFolder = Join-Path $folder 'GPO'
+    New-Item -ItemType Directory -Path $gpoFolder -Force | Out-Null
+    $gpoLinkedFolder = Join-Path $gpoFolder 'linked'
+    New-Item -ItemType Directory -Path $gpoLinkedFolder -Force | Out-Null
+    $gpoUnlinkedFolder = Join-Path $gpoFolder 'unlinked'
+    New-Item -ItemType Directory -Path $gpoUnlinkedFolder -Force | Out-Null
     return [pscustomobject]@{
-        Root          = $root
-        Folder        = $folder
-        LogFile       = $logFile
-        ReportsFolder = $reports
-        IndexXml      = (Join-Path $folder 'linked-gpos.xml')
-        XsdPath       = (Join-Path $folder 'validation.xsd')
+        Root               = $root
+        Folder             = $folder
+        LogFile            = $logFile
+        GpoLinkedFolder    = $gpoLinkedFolder
+        GpoUnlinkedFolder  = $gpoUnlinkedFolder
+        IndexXml           = (Join-Path $folder 'linked-gpos.xml')
+        XsdPath            = (Join-Path $folder 'validation.xsd')
     }
 }
 
@@ -275,51 +387,90 @@ function Normalize-GpoPermissions {
     return $results.Values
 }
 
-function Export-GpoReport {
+function Export-GpoDualReport {
     param(
         [Parameter(Mandatory)][string]$GpoId,
-        [Parameter(Mandatory)][string]$ReportsFolder,
+        [Parameter(Mandatory)][string]$TargetFolder,
+        [Parameter(Mandatory)][string]$Domain,
+        [Parameter(Mandatory)][hashtable]$UsedFilenames,
+        [Parameter()][bool]$SkipXml,
+        [Parameter()][bool]$SkipHtml
+    )
+    $result = [pscustomobject]@{
+        DisplayName = $null
+        Guid = $GpoId
+        XmlSuccess = $false
+        HtmlSuccess = $false
+        XmlPath = $null
+        HtmlPath = $null
+        Error = $null
+    }
+    
+    try {
+        $gpo = Get-GPO -Guid $GpoId -Domain $Domain -ErrorAction Stop
+        $result.DisplayName = $gpo.DisplayName
+        
+        $baseFileName = Sanitize-FileName -Name $gpo.DisplayName
+        if ($UsedFilenames.ContainsKey($baseFileName)) {
+            $baseFileName = "${baseFileName}_${GpoId}"
+        }
+        $UsedFilenames[$baseFileName] = $true
+        
+        if (-not $SkipXml) {
+            $xmlPath = Join-Path $TargetFolder "${baseFileName}.xml"
+            try {
+                Get-GPOReport -Guid $GpoId -Domain $Domain -ReportType Xml -Path $xmlPath -ErrorAction Stop | Out-Null
+                $result.XmlSuccess = $true
+                $result.XmlPath = $xmlPath
+            } catch {
+                Write-Log "Failed to export XML for GPO $($gpo.DisplayName): $_" 'WARN'
+            }
+        }
+        
+        if (-not $SkipHtml) {
+            $htmlPath = Join-Path $TargetFolder "${baseFileName}.html"
+            try {
+                Get-GPOReport -Guid $GpoId -Domain $Domain -ReportType Html -Path $htmlPath -ErrorAction Stop | Out-Null
+                $result.HtmlSuccess = $true
+                $result.HtmlPath = $htmlPath
+            } catch {
+                Write-Log "Failed to export HTML for GPO $($gpo.DisplayName): $_" 'WARN'
+            }
+        }
+        
+    } catch {
+        $result.Error = $_.Exception.Message
+        Write-Log "Failed to retrieve GPO ${GpoId}: $_" 'WARN'
+    }
+    
+    return $result
+}
+
+function Get-AllGpos {
+    param(
         [Parameter(Mandatory)][string]$Domain
     )
     try {
-        $gpo = Get-GPO -Guid $GpoId -Domain $Domain -ErrorAction Stop
+        $gpos = Get-GPO -All -Domain $Domain -ErrorAction Stop
+        Write-Log "Found $($gpos.Count) GPOs in domain: $Domain"
+        return @($gpos)
     } catch {
-        return $null
+        Write-Log "Failed to enumerate GPOs in ${Domain}: $_" 'WARN'
+        return @()
     }
-    $file = (Sanitize-FileName -Name $gpo.DisplayName) + '.xml'
-    $path = Join-Path $ReportsFolder $file
-    try { Get-GPOReport -Guid $GpoId -Domain $Domain -ReportType Xml -Path $path | Out-Null } catch {}
-    return [pscustomobject]@{ Path=$path; Gpo=$gpo }
-}
-
-function Get-WmiFilterQueryFromReport {
-    param([Parameter(Mandatory)][string]$ReportPath)
-    try { [xml]$doc = Get-Content -LiteralPath $ReportPath -Raw } catch { return $null }
-    $node = $doc.SelectSingleNode("//*[translate(local-name(),'abcdefghijklmnopqrstuvwxyz','ABCDEFGHIJKLMNOPQRSTUVWXYZ')='QUERY']")
-    if ($node -and $node.InnerText) { return $node.InnerText.Trim() }
-    return $null
 }
 
 function Get-GpoWmiInfo {
     param(
         [Parameter(Mandatory)][string]$GpoId,
-        [Parameter(Mandatory)][string]$ReportsFolder,
-        [Parameter(Mandatory)][string]$Domain,
-        [switch]$SkipReports
+        [Parameter(Mandatory)][string]$Domain
     )
-    $name=$null; $id=$null; $query=$null
+    $name=$null; $id=$null
     try {
         $gpoObj = Get-GPO -Guid $GpoId -Domain $Domain -ErrorAction Stop
         if ($gpoObj.WmiFilter) { $name = [string]$gpoObj.WmiFilter.Name; $id = [string]$gpoObj.WmiFilter.Id }
     } catch {}
-    if (-not $SkipReports) {
-        $rep = Export-GpoReport -GpoId $GpoId -ReportsFolder $ReportsFolder -Domain $Domain
-        if ($rep -and (Test-Path -LiteralPath $rep.Path)) {
-            $q = Get-WmiFilterQueryFromReport -ReportPath $rep.Path
-            if ($q) { $query = $q }
-        }
-    }
-    return [pscustomobject]@{ Name=$name; Id=$id; Query=$query }
+    return [pscustomobject]@{ Name=$name; Id=$id }
 }
 
 function Get-GpoLinksForOu {
@@ -340,9 +491,7 @@ function Write-PerOuXml {
         [Parameter(Mandatory)][string]$OuDn,
         [Parameter(Mandatory)][string]$Domain,
         [Parameter()][bool]$InheritanceBlocked,
-        [Parameter()][array]$GpoLinks,
-        [Parameter(Mandatory)][string]$ReportsFolder,
-        [Parameter()][switch]$SkipGpoReports
+        [Parameter()][array]$GpoLinks
     )
     $xml = New-Object System.Xml.XmlDocument
     $decl = $xml.CreateXmlDeclaration('1.0','UTF-8',$null)
@@ -365,7 +514,11 @@ function Write-PerOuXml {
         $guidStr = [string]$link.GPOId
         if (-not $guidStr) { $guidStr = [string]$link.GpoId }
         if ($guidStr -and $guidStr -notmatch '^\{.*\}$') { $guidStr = '{' + $guidStr.Trim('{}') + '}' }
-        if ($guidStr) { $null = $g.SetAttribute('guid', $guidStr) }
+        if ($guidStr) { 
+            $null = $g.SetAttribute('guid', $guidStr)
+            $normalizedGuid = Normalize-GpoGuid -GuidStr $guidStr
+            $script:LinkedGpoGuids[$normalizedGuid] = $true
+        }
         $null = $g.SetAttribute('enabled', ([bool]$link.Enabled).ToString().ToLower())
         $null = $g.SetAttribute('enforced', ([bool]$link.Enforced).ToString().ToLower())
         if ($null -ne $link.Order) { $null = $g.SetAttribute('order', [string]$link.Order) }
@@ -383,12 +536,11 @@ function Write-PerOuXml {
             $g.AppendChild($sec) | Out-Null
         }
 
-        $wmi = Get-GpoWmiInfo -GpoId $guidStr -ReportsFolder $ReportsFolder -Domain $Domain -SkipReports:$SkipGpoReports
-        if ($wmi.Name -or $wmi.Id -or $wmi.Query) {
+        $wmi = Get-GpoWmiInfo -GpoId $guidStr -Domain $Domain
+        if ($wmi.Name -or $wmi.Id) {
             $w = $xml.CreateElement('WmiFilter')
             if ($wmi.Name) { $null = $w.SetAttribute('name', [string]$wmi.Name) }
             if ($wmi.Id) { $null = $w.SetAttribute('id', [string]$wmi.Id) }
-            if ($wmi.Query) { $null = $w.SetAttribute('query', [string]$wmi.Query) }
             $g.AppendChild($w) | Out-Null
         }
 
@@ -430,7 +582,7 @@ foreach ($dom in $domains) {
 
     if (-not $ExcludeDomainRoot) {
         $rootLinks = Get-DomainRootLinks -DomainDn $domainDn
-        Write-DomainRootXml -OutFolder $out.Folder -Domain $dom -DomainDn $domainDn -GpoLinks $rootLinks -ReportsFolder $out.ReportsFolder -SkipGpoReports:$SkipGpoReports
+        Write-DomainRootXml -OutFolder $out.Folder -Domain $dom -DomainDn $domainDn -GpoLinks $rootLinks
     }
     $ous = @()
     if ($adAvailable) {
@@ -442,8 +594,54 @@ foreach ($dom in $domains) {
         $inheritBlocked = $false
         if ($ou.gPOptions -ne $null) { try { $inheritBlocked = ( ($ou.gPOptions -band 1) -eq 1 ) } catch {} }
         $gpoLinks = Get-GpoLinksForOu -OuDn $ou.DistinguishedName
-        Write-PerOuXml -OutFolder $out.Folder -OuDn $ou.DistinguishedName -Domain $dom -InheritanceBlocked:$inheritBlocked -GpoLinks $gpoLinks -ReportsFolder $out.ReportsFolder -SkipGpoReports:$SkipGpoReports
+        Write-PerOuXml -OutFolder $out.Folder -OuDn $ou.DistinguishedName -Domain $dom -InheritanceBlocked:$inheritBlocked -GpoLinks $gpoLinks
     }
+}
+
+if (-not ($SkipXml -and $SkipHtml)) {
+    Write-Log "=== Starting GPO Export Phase ==="
+    $usedFilenames = @{}
+    $totalLinked = 0
+    $totalUnlinked = 0
+    $totalXmlSuccess = 0
+    $totalHtmlSuccess = 0
+    $totalFailed = 0
+    
+    foreach ($dom in $domains) {
+        Write-Log "Exporting all GPOs for domain: $dom"
+        $allGpos = Get-AllGpos -Domain $dom
+        
+        if ($allGpos.Count -eq 0) {
+            Write-Log "No GPOs found in domain $dom" 'WARN'
+            continue
+        }
+        
+        foreach ($gpo in $allGpos) {
+            $normalizedGuid = Normalize-GpoGuid -GuidStr $gpo.Id
+            $isLinked = $script:LinkedGpoGuids.ContainsKey($normalizedGuid)
+            $targetFolder = if ($isLinked) { $out.GpoLinkedFolder } else { $out.GpoUnlinkedFolder }
+            $classification = if ($isLinked) { "linked" } else { "unlinked" }
+            
+            Write-Log "Processing GPO: $($gpo.DisplayName) ($($gpo.Id)) - $classification"
+            
+            $result = Export-GpoDualReport -GpoId $gpo.Id -TargetFolder $targetFolder -Domain $dom -UsedFilenames $usedFilenames -SkipXml $SkipXml -SkipHtml $SkipHtml
+            
+            if ($isLinked) { $totalLinked++ } else { $totalUnlinked++ }
+            if ($result.XmlSuccess) { $totalXmlSuccess++ }
+            if ($result.HtmlSuccess) { $totalHtmlSuccess++ }
+            if (-not $result.XmlSuccess -and -not $result.HtmlSuccess) { $totalFailed++ }
+        }
+    }
+    
+    Write-Log "=== GPO Export Summary ==="
+    Write-Log "Total GPOs processed: $($totalLinked + $totalUnlinked)"
+    Write-Log "Linked GPOs: $totalLinked"
+    Write-Log "Unlinked GPOs: $totalUnlinked"
+    Write-Log "Successful XML exports: $totalXmlSuccess"
+    Write-Log "Successful HTML exports: $totalHtmlSuccess"
+    Write-Log "Failed exports: $totalFailed"
+} else {
+    Write-Log "Skipping GPO export phase (both -SkipXml and -SkipHtml specified)"
 }
 
 Write-IndexXml -Path $out.IndexXml -Domain $hostInfo.Domain
