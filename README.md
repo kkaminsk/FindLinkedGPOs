@@ -7,7 +7,8 @@ A PowerShell script to audit Active Directory Group Policy Object (GPO) links an
 - **Complete GPO Inventory**: Enumerates all GPOs in the domain (not just linked ones)
 - **Dual-Format Reports**: Exports both XML and HTML for each GPO
 - **Linked/Unlinked Classification**: Organizes GPOs by whether they're linked to OUs, domain root, or Sites
-- **Granular Export Control**: Skip XML or HTML exports individually with `-SkipXml` and `-SkipHtml`
+- **WMI Filter Query Extraction**: Captures complete WMI filter logic including query text
+- **Granular Export Control**: Skip XML, HTML, or WMI query exports individually
 - **Link Metadata**: Captures link attributes (enabled, enforced, order), security filtering, and WMI filters
 - **Multi-Domain Support**: Audit multiple domains in a single run
 - **Automatic ZIP Compression**: Creates compressed archives of output (optional)
@@ -86,6 +87,10 @@ Find-LinkedGPOs-YYYY-MM-DD-HH-MM/
 │       ├── GPOName.xml
 │       ├── GPOName.html
 │       └── ...
+├── WMI/                           # WMI filter queries
+│   ├── {FilterGUID1}.xml
+│   ├── {FilterGUID2}.xml
+│   └── ...
 ├── DomainRoot--domain-linked-gpos.xml    # Domain root links
 ├── OU_DN--domain-linked-gpos.xml         # Per-OU links
 ├── linked-gpos.xml                       # Aggregated index
@@ -96,7 +101,8 @@ Find-LinkedGPOs-YYYY-MM-DD-HH-MM/
 ### Output Files
 
 - **GPO Reports**: Both XML (machine-parseable) and HTML (human-readable) formats
-- **Link Data**: Per-OU and domain root XML files with link metadata
+- **WMI Filters**: Individual XML files per WMI filter with Name, Id, and Query
+- **Link Data**: Per-OU and domain root XML files with link metadata (includes query attribute when available)
 - **Classification**: Separate folders for linked vs. unlinked GPOs
 - **Log File**: Detailed execution log with timestamps
 - **ZIP Archive**: Compressed version of the entire output (unless -NoZip)
@@ -106,9 +112,10 @@ Find-LinkedGPOs-YYYY-MM-DD-HH-MM/
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `-OutputRoot` | String | Root directory for output (prompts if not specified) |
-| `-SkipGpoReports` | Switch | Skip all GPO exports (backward compatibility) |
+| `-SkipGpoReports` | Switch | Skip all GPO exports and WMI queries (backward compatibility) |
 | `-SkipXml` | Switch | Skip XML report generation |
 | `-SkipHtml` | Switch | Skip HTML report generation |
+| `-SkipWmiQueries` | Switch | Skip WMI filter query extraction |
 | `-Domain` | String[] | One or more domains to audit |
 | `-Credential` | PSCredential | Alternate credentials for domain access |
 | `-SearchBase` | String | LDAP search base for OU enumeration |
@@ -151,7 +158,7 @@ For each linked GPO, the script captures:
 - **Enforcement**: Whether link is enforced
 - **Order**: Application order
 - **Security Filtering**: Principals with Apply Group Policy permissions
-- **WMI Filter**: Name and ID (if applied)
+- **WMI Filter**: Name, ID, and Query text (if applied)
 
 ## Notes
 
@@ -162,6 +169,11 @@ For each linked GPO, the script captures:
 - Unlinked GPOs may represent unused policies that can be cleaned up
 
 ## Version History
+
+### Version 2.1
+- Added WMI filter query extraction with dedicated WMI folder
+- Added `-SkipWmiQueries` parameter for granular control
+- WMI filter query attribute included in link enumeration XMLs
 
 ### Version 2.0
 - Added dual-format exports (XML + HTML)

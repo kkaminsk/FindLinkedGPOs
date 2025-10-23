@@ -22,6 +22,10 @@
 .PARAMETER SkipHtml
     Skips HTML report generation. XML reports will still be created unless -SkipXml is also specified.
 
+.PARAMETER SkipWmiQueries
+    Skips WMI filter query extraction. WMI filter Name and ID will still be captured, but query text will not be extracted.
+    Automatically enabled when both -SkipXml and -SkipHtml are specified.
+
 .PARAMETER Domain
     Specifies one or more domains to enumerate. If not provided, uses the current domain.
 
@@ -57,6 +61,11 @@
     
     Audits GPO links but skips all report generation (backward compatibility mode).
 
+.EXAMPLE
+    .\Find-LinkedGPOs.ps1 -SkipWmiQueries
+    
+    Exports GPO reports but skips WMI filter query extraction (faster execution).
+
 .OUTPUTS
     Creates a timestamped folder structure:
     Find-LinkedGPOs-YYYY-MM-DD-HH-MM/
@@ -67,13 +76,17 @@
     │   └── unlinked/     (GPOs not linked anywhere)
     │       ├── GPOName.xml
     │       └── GPOName.html
+    ├── WMI/              (WMI filter queries)
+    │   ├── {FilterGUID1}.xml
+    │   ├── {FilterGUID2}.xml
+    │   └── ...
     ├── *.xml files       (Per-OU and domain root link data)
     ├── linked-gpos.xml   (Aggregated index)
     ├── validation.xsd    (XML schema)
     └── Find-LinkedGPOs-YYYY-MM-DD-HH-MM.log
 
 .NOTES
-    Version: 2.0
+    Version: 2.1
     Requires: ActiveDirectory and GroupPolicy PowerShell modules
     Requires: PowerShell 5.1 or later
     Requires: Domain member or RSAT with appropriate permissions
@@ -96,6 +109,9 @@ param(
     [switch]$SkipHtml,
 
     [Parameter()]
+    [switch]$SkipWmiQueries,
+
+    [Parameter()]
     [string[]]$Domain,
 
     [Parameter()]
@@ -114,14 +130,23 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-# Backward compatibility: -SkipGpoReports sets both new skip flags
+# Backward compatibility: -SkipGpoReports sets all skip flags
 if ($SkipGpoReports) {
     $SkipXml = $true
     $SkipHtml = $true
+    $SkipWmiQueries = $true
+}
+
+# Auto-skip WMI queries when both XML and HTML are skipped (no GPO reports to extract from)
+if ($SkipXml -and $SkipHtml) {
+    $SkipWmiQueries = $true
 }
 
 # Track linked GPO GUIDs for classification
 $script:LinkedGpoGuids = @{}
+
+# Track WMI filter queries (GUID -> query object with Name, Id, Query)
+$script:WmiFilterQueries = @{}
 
 function New-TimestampString {
     (Get-Date).ToString('yyyy-MM-dd-HH-mm')
@@ -153,7 +178,8 @@ function Write-DomainRootXml {
         [Parameter(Mandatory)][string]$OutFolder,
         [Parameter(Mandatory)][string]$Domain,
         [Parameter(Mandatory)][string]$DomainDn,
-        [Parameter()][array]$GpoLinks
+        [Parameter()][array]$GpoLinks,
+        [Parameter()][bool]$SkipWmiQueries
     )
     $xml = New-Object System.Xml.XmlDocument
     $decl = $xml.CreateXmlDeclaration('1.0','UTF-8',$null)
@@ -197,11 +223,12 @@ function Write-DomainRootXml {
             $g.AppendChild($sec) | Out-Null
         }
 
-        $wmi = Get-GpoWmiInfo -GpoId $guidStr -Domain $Domain
+        $wmi = Get-GpoWmiInfo -GpoId $guidStr -Domain $Domain -SkipWmiQueries $SkipWmiQueries
         if ($wmi.Name -or $wmi.Id) {
             $w = $xml.CreateElement('WmiFilter')
             if ($wmi.Name) { $null = $w.SetAttribute('name', [string]$wmi.Name) }
             if ($wmi.Id) { $null = $w.SetAttribute('id', [string]$wmi.Id) }
+            if ($wmi.Query) { $null = $w.SetAttribute('query', [string]$wmi.Query) }
             $g.AppendChild($w) | Out-Null
         }
 
@@ -250,12 +277,15 @@ function Initialize-Output {
     New-Item -ItemType Directory -Path $gpoLinkedFolder -Force | Out-Null
     $gpoUnlinkedFolder = Join-Path $gpoFolder 'unlinked'
     New-Item -ItemType Directory -Path $gpoUnlinkedFolder -Force | Out-Null
+    $wmiFolder = Join-Path $folder 'WMI'
+    New-Item -ItemType Directory -Path $wmiFolder -Force | Out-Null
     return [pscustomobject]@{
         Root               = $root
         Folder             = $folder
         LogFile            = $logFile
         GpoLinkedFolder    = $gpoLinkedFolder
         GpoUnlinkedFolder  = $gpoUnlinkedFolder
+        WmiFolder          = $wmiFolder
         IndexXml           = (Join-Path $folder 'linked-gpos.xml')
         XsdPath            = (Join-Path $folder 'validation.xsd')
     }
@@ -460,17 +490,72 @@ function Get-AllGpos {
     }
 }
 
+function Get-WmiFilterQueryFromXml {
+    param([Parameter(Mandatory)][string]$XmlPath)
+    try {
+        [xml]$doc = Get-Content -LiteralPath $XmlPath -Raw -ErrorAction Stop
+        # Look for Query element within WMI filter section
+        $node = $doc.SelectSingleNode("//*[translate(local-name(),'abcdefghijklmnopqrstuvwxyz','ABCDEFGHIJKLMNOPQRSTUVWXYZ')='QUERY']")
+        if ($node -and $node.InnerText) {
+            return $node.InnerText.Trim()
+        }
+    } catch {
+        Write-Log "Failed to parse WMI filter query from XML: $_" 'WARN'
+    }
+    return $null
+}
+
 function Get-GpoWmiInfo {
     param(
         [Parameter(Mandatory)][string]$GpoId,
-        [Parameter(Mandatory)][string]$Domain
+        [Parameter(Mandatory)][string]$Domain,
+        [Parameter()][bool]$SkipWmiQueries
     )
-    $name=$null; $id=$null
+    $name=$null; $id=$null; $query=$null
+    
     try {
         $gpoObj = Get-GPO -Guid $GpoId -Domain $Domain -ErrorAction Stop
-        if ($gpoObj.WmiFilter) { $name = [string]$gpoObj.WmiFilter.Name; $id = [string]$gpoObj.WmiFilter.Id }
-    } catch {}
-    return [pscustomobject]@{ Name=$name; Id=$id }
+        if ($gpoObj.WmiFilter) {
+            $name = [string]$gpoObj.WmiFilter.Name
+            $id = [string]$gpoObj.WmiFilter.Id
+            
+            # Extract query if not skipping and not already cached
+            if (-not $SkipWmiQueries -and $id) {
+                $normalizedId = Normalize-GpoGuid -GuidStr $id
+                
+                if ($script:WmiFilterQueries.ContainsKey($normalizedId)) {
+                    # Use cached query
+                    $query = $script:WmiFilterQueries[$normalizedId].Query
+                } else {
+                    # Generate temporary XML to extract query
+                    try {
+                        $tempFile = [System.IO.Path]::GetTempFileName()
+                        Get-GPOReport -Guid $GpoId -Domain $Domain -ReportType Xml -Path $tempFile -ErrorAction Stop | Out-Null
+                        $query = Get-WmiFilterQueryFromXml -XmlPath $tempFile
+                        
+                        # Cache the result
+                        $script:WmiFilterQueries[$normalizedId] = [pscustomobject]@{
+                            Name  = $name
+                            Id    = $normalizedId
+                            Query = $query
+                        }
+                        
+                        Write-Log "Extracted WMI filter query for: $name ($normalizedId)"
+                    } catch {
+                        Write-Log "Failed to extract WMI filter query for GPO ${GpoId}: $_" 'WARN'
+                    } finally {
+                        if ($tempFile -and (Test-Path $tempFile)) {
+                            Remove-Item $tempFile -Force -ErrorAction SilentlyContinue
+                        }
+                    }
+                }
+            }
+        }
+    } catch {
+        Write-Log "Failed to retrieve GPO ${GpoId} for WMI info: $_" 'WARN'
+    }
+    
+    return [pscustomobject]@{ Name=$name; Id=$id; Query=$query }
 }
 
 function Get-GpoLinksForOu {
@@ -491,7 +576,8 @@ function Write-PerOuXml {
         [Parameter(Mandatory)][string]$OuDn,
         [Parameter(Mandatory)][string]$Domain,
         [Parameter()][bool]$InheritanceBlocked,
-        [Parameter()][array]$GpoLinks
+        [Parameter()][array]$GpoLinks,
+        [Parameter()][bool]$SkipWmiQueries
     )
     $xml = New-Object System.Xml.XmlDocument
     $decl = $xml.CreateXmlDeclaration('1.0','UTF-8',$null)
@@ -536,11 +622,12 @@ function Write-PerOuXml {
             $g.AppendChild($sec) | Out-Null
         }
 
-        $wmi = Get-GpoWmiInfo -GpoId $guidStr -Domain $Domain
+        $wmi = Get-GpoWmiInfo -GpoId $guidStr -Domain $Domain -SkipWmiQueries $SkipWmiQueries
         if ($wmi.Name -or $wmi.Id) {
             $w = $xml.CreateElement('WmiFilter')
             if ($wmi.Name) { $null = $w.SetAttribute('name', [string]$wmi.Name) }
             if ($wmi.Id) { $null = $w.SetAttribute('id', [string]$wmi.Id) }
+            if ($wmi.Query) { $null = $w.SetAttribute('query', [string]$wmi.Query) }
             $g.AppendChild($w) | Out-Null
         }
 
@@ -551,6 +638,64 @@ function Write-PerOuXml {
     $path = Join-Path $OutFolder $file
     $xml.Save($path)
     Write-Log "Wrote per-OU XML: $path"
+}
+
+function Write-WmiFilterFiles {
+    param(
+        [Parameter(Mandatory)][string]$WmiFolder,
+        [Parameter(Mandatory)][hashtable]$FilterCache
+    )
+    
+    if ($FilterCache.Count -eq 0) {
+        Write-Log "No WMI filters to write"
+        return
+    }
+    
+    Write-Log "Writing WMI filter files..."
+    $successCount = 0
+    $failCount = 0
+    
+    foreach ($filterId in $FilterCache.Keys) {
+        $filter = $FilterCache[$filterId]
+        $fileName = "$filterId.xml"
+        $filePath = Join-Path $WmiFolder $fileName
+        
+        try {
+            $xml = New-Object System.Xml.XmlDocument
+            $decl = $xml.CreateXmlDeclaration('1.0', 'UTF-8', $null)
+            $xml.AppendChild($decl) | Out-Null
+            
+            $root = $xml.CreateElement('WmiFilter')
+            $xml.AppendChild($root) | Out-Null
+            
+            if ($filter.Name) {
+                $nameElem = $xml.CreateElement('Name')
+                $nameElem.InnerText = $filter.Name
+                $root.AppendChild($nameElem) | Out-Null
+            }
+            
+            if ($filter.Id) {
+                $idElem = $xml.CreateElement('Id')
+                $idElem.InnerText = $filter.Id
+                $root.AppendChild($idElem) | Out-Null
+            }
+            
+            if ($filter.Query) {
+                $queryElem = $xml.CreateElement('Query')
+                $queryElem.InnerText = $filter.Query
+                $root.AppendChild($queryElem) | Out-Null
+            }
+            
+            $xml.Save($filePath)
+            $successCount++
+        } catch {
+            $errorMsg = $_.Exception.Message
+            Write-Log "Failed to write WMI filter file ${fileName}: $errorMsg" 'WARN'
+            $failCount++
+        }
+    }
+    
+    Write-Log "WMI filter files written: $successCount succeeded, $failCount failed"
 }
 
 # --- Main ---
@@ -582,7 +727,7 @@ foreach ($dom in $domains) {
 
     if (-not $ExcludeDomainRoot) {
         $rootLinks = Get-DomainRootLinks -DomainDn $domainDn
-        Write-DomainRootXml -OutFolder $out.Folder -Domain $dom -DomainDn $domainDn -GpoLinks $rootLinks
+        Write-DomainRootXml -OutFolder $out.Folder -Domain $dom -DomainDn $domainDn -GpoLinks $rootLinks -SkipWmiQueries $SkipWmiQueries
     }
     $ous = @()
     if ($adAvailable) {
@@ -594,8 +739,13 @@ foreach ($dom in $domains) {
         $inheritBlocked = $false
         if ($ou.gPOptions -ne $null) { try { $inheritBlocked = ( ($ou.gPOptions -band 1) -eq 1 ) } catch {} }
         $gpoLinks = Get-GpoLinksForOu -OuDn $ou.DistinguishedName
-        Write-PerOuXml -OutFolder $out.Folder -OuDn $ou.DistinguishedName -Domain $dom -InheritanceBlocked:$inheritBlocked -GpoLinks $gpoLinks
+        Write-PerOuXml -OutFolder $out.Folder -OuDn $ou.DistinguishedName -Domain $dom -InheritanceBlocked:$inheritBlocked -GpoLinks $gpoLinks -SkipWmiQueries $SkipWmiQueries
     }
+}
+
+# Write WMI filter files if queries were extracted
+if (-not $SkipWmiQueries -and $script:WmiFilterQueries.Count -gt 0) {
+    Write-WmiFilterFiles -WmiFolder $out.WmiFolder -FilterCache $script:WmiFilterQueries
 }
 
 if (-not ($SkipXml -and $SkipHtml)) {
