@@ -16,10 +16,49 @@ A PowerShell script to audit Active Directory Group Policy Object (GPO) links an
 
 ## Requirements
 
+### Software Requirements
 - **PowerShell**: 5.1 or later
-- **Modules**: ActiveDirectory and GroupPolicy (RSAT)
-- **Permissions**: Read access to AD and GPO metadata
-- **Platform**: Windows domain-joined machine or DC
+- **Modules**: 
+  - ActiveDirectory (RSAT)
+  - GroupPolicy (RSAT)
+- **Platform**: Windows domain-joined machine or Domain Controller
+
+### Permissions Required
+
+The script performs **read-only operations** and requires the following permissions:
+
+#### Active Directory Permissions
+- **Read access to Domain objects** - For domain enumeration and metadata
+- **Read access to Organizational Unit (OU) objects** - For OU hierarchy traversal
+- **Read access to WMI Filter objects** - Specifically:
+  - Objects in `CN=SOM,CN=WMIPolicy,CN=System,DC=...`
+  - Read the `msWMI-Parm2` attribute (contains WMI query text)
+
+#### Group Policy Permissions
+- **Read access to GPO objects** - Query GPO metadata and properties
+- **Read GPO reports** - Generate XML and HTML reports
+
+#### File System Permissions
+- **Write access** to the output directory (Documents, C:\Temp, or custom path)
+- **Create directories and files**
+
+### Recommended Access Levels
+
+**Minimum (works for most scenarios):**
+- Standard **Domain User** account
+  - Default AD read permissions are sufficient
+  - All authenticated users can read GPOs by default
+  - Write access to local output folder
+
+**Recommended (for comprehensive access):**
+- Member of **Group Policy Creator Owners** (domain group)
+- Member of **Account Operators** (domain group)
+- Or **Domain Admins** (for unrestricted access)
+
+**Notes:**
+- No local administrator privileges required (unless writing to protected folders)
+- Use `-Credential` parameter if running under a different account
+- The script does **NOT modify** any AD objects or GPOs
 
 ## Installation
 
